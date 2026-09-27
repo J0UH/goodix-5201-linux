@@ -1,0 +1,41 @@
+# Maintainer: Jodi U. H. <217747670+J0UH@users.noreply.github.com>
+#
+# libfprint with the goodix5201 driver for the Goodix 27c6:5201 fingerprint
+# sensor (e.g. ASUS ZenBook S UX391UA) and the SIGFM matcher from libfprint
+# MR !530. Built from the "libfprint" branch of
+# https://github.com/J0UH/goodix-5201-linux (upstream libfprint 6f9479c3 +
+# MR !530 + the driver).
+#
+# It also provides libfprint-git: Omarchy's fingerprint setup installs
+# libfprint-git when no package of that name is present, which would replace
+# this package.
+
+pkgname=libfprint-goodix-5201
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="libfprint with a driver for the Goodix 27c6:5201 fingerprint sensor (ASUS ZenBook S UX391UA)"
+arch=(x86_64)
+url="https://github.com/J0UH/goodix-5201-linux"
+license=(LGPL-2.1-or-later)
+depends=(gcc-libs glib2 glibc libgudev libgusb opencv openssl pixman)
+makedepends=(git glib2-devel gobject-introspection meson ninja)
+provides=("libfprint=1.94.100" libfprint-2.so libfprint-git)
+conflicts=(libfprint libfprint-git)
+source=("libfprint::git+https://github.com/J0UH/goodix-5201-linux.git#tag=v$pkgver"
+        77-goodix-5201-mm-ignore.rules)
+b2sums=('SKIP'
+        '176c2a9c0dcbbce8dc5139e7b5a60959ca434d73390245d3f37633897200c27db10e881e451ea132bf67fda1b759b9966d69a8e5e7ae81302cfc9834ea73ffdf')
+
+build() {
+  arch-meson libfprint build \
+    -D drivers=default \
+    -D doc=false \
+    -D gtk-examples=false \
+    -D installed-tests=false
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  install -Dm644 77-goodix-5201-mm-ignore.rules -t "$pkgdir/usr/lib/udev/rules.d/"
+}

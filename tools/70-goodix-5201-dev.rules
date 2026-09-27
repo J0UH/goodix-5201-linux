@@ -1,0 +1,8 @@
+# Development only: give the logged-in desktop user access to the Goodix
+# 27c6:5201 sensor, so the Python tools in this directory can run without
+# root. Not needed for fprintd, which runs as root.
+#
+#   sudo install -m644 70-goodix-5201-dev.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="5201", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="5201", TAG+="uaccess"

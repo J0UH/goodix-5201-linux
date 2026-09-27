@@ -1,0 +1,1207 @@
+From ee7862f82ea3b4f8725a02ea5bb25db9b123c35a Mon Sep 17 00:00:00 2001
+From: "Jodi U. H." <217747670+J0UH@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 01:15:06 +0200
+Subject: [PATCH 3/4] goodix5201: Add driver for Goodix 27c6:5201
+
+Match-on-host press sensor with a 108x88 pixel, 12 bit sensor behind an
+HT32 USB bridge running non-TLS firmware (GF32xx_HT_APP_20041), found e.g.
+in the ASUS ZenBook S UX391UA.
+
+The device enumerates as a CDC ACM modem; the driver claims both
+interfaces and talks the Goodix wrapless protocol over the bulk endpoints
+of the data interface. On activation it uploads the sensor configuration
+to MCU RAM, calibrates finger detection and records an empty-sensor
+background frame. Frames are polled and compared against that background;
+the background is only accepted from frames without ridge structure, so a
+finger resting on the sensor during activation is handled.
+
+Frame data is obfuscated with the Goodix GEA stream cipher using a fixed
+key and protected by a CRC32/MPEG-2.
+
+The sensor is too small for NBIS matching (only 2-3 real minutiae per
+image), so the driver uses SIGFM.
+---
+ libfprint/drivers/goodix5201.c | 1103 ++++++++++++++++++++++++++++++++
+ libfprint/drivers/goodix5201.h |   34 +
+ libfprint/meson.build          |    1 +
+ meson.build                    |    1 +
+ 4 files changed, 1139 insertions(+)
+ create mode 100644 libfprint/drivers/goodix5201.c
+ create mode 100644 libfprint/drivers/goodix5201.h
+
+diff --git a/libfprint/drivers/goodix5201.c b/libfprint/drivers/goodix5201.c
+new file mode 100644
+index 00000000..798fd276
+--- /dev/null
++++ b/libfprint/drivers/goodix5201.c
+@@ -0,0 +1,1103 @@
++/*
++ * Goodix 27c6:5201 driver for libfprint
++ *
++ * Copyright (C) 2026 Jodi U. H.
++ *
++ * Match-on-host press sensor (108x88 pixels, 12 bit) behind an HT32 USB
++ * bridge MCU running non-TLS firmware ("GF32xx_HT_APP_20041"), found e.g. in
++ * the ASUS ZenBook S UX391UA.
++ *
++ * Protocol summary (see the protocol specification for details):
++ *  - Goodix "wrapless" messages over the bulk endpoints of the CDC data
++ *    interface: [cmd] [len u16 LE] [payload] [checksum], sent in 64 byte
++ *    chunks; continuation chunks start with cmd | 1. Every host message is
++ *    acknowledged with an 0xb0 message.
++ *  - A 256 byte sensor configuration is uploaded to MCU RAM on activation.
++ *  - Frames are 5 byte header + 12 bit packed pixels + CRC32/MPEG-2 over the
++ *    pixel data. The pixel data is obfuscated with the Goodix GEA stream
++ *    cipher using a fixed key.
++ *  - The sensor area is too small for NBIS minutiae matching, so SIGFM is
++ *    used.
++ *
++ * Parts of the protocol knowledge come from goodix-fp-linux-dev/goodix-fp-dump.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#define FP_COMPONENT "goodix5201"
++
++#include <math.h>
++
++#include "drivers_api.h"
++#include "goodix5201.h"
++
++#define GDX_IFACE_COMM 0
++#define GDX_IFACE_DATA 1
++#define GDX_EP_OUT 0x03
++#define GDX_EP_IN 0x81
++#define GDX_CHUNK 64
++#define GDX_MAX_EMPTY 10
++
++/* Stale input (e.g. replies to a modem probe sent through the cdc_acm tty
++ * while the device was not in use) is drained before talking to the MCU. */
++#define GDX_DRAIN_TIMEOUT 50
++#define GDX_DRAIN_MAX 64
++
++/* Only the non-TLS firmware is supported ("GF5288_HT_APP_20041"; the name
++ * prefix changes to GF3208 once the sensor configuration is uploaded) */
++#define GDX_FIRMWARE_MATCH "_HT_APP_"
++
++#define GDX_ACK_TIMEOUT 1000
++#define GDX_REPLY_TIMEOUT 1000
++#define GDX_IMAGE_TIMEOUT 3000
++
++#define GDX_CMD_PING 0x00
++#define GDX_CMD_IMAGE 0x20
++#define GDX_CMD_FDT_MANUAL 0x36
++#define GDX_CMD_SLEEP 0x60
++#define GDX_CMD_CONFIG 0x90
++#define GDX_CMD_RESET 0xa2
++#define GDX_CMD_FIRMWARE 0xa8
++#define GDX_CMD_ACK 0xb0
++#define GDX_CMD_DRV_STATE 0xc4
++
++#define GDX_SENSOR_WIDTH 108
++#define GDX_SENSOR_HEIGHT 88
++#define GDX_SENSOR_PIXELS (GDX_SENSOR_WIDTH * GDX_SENSOR_HEIGHT)
++#define GDX_IMAGE_BYTES (GDX_SENSOR_PIXELS * 3 / 2)
++#define GDX_IMAGE_HEADER 5
++#define GDX_IMAGE_CRC 4
++#define GDX_GEA_KEY 0x12345678
++
++/* Edge rows/columns are not usable fingerprint area */
++#define GDX_CROP 2
++#define GDX_CROP_WIDTH (GDX_SENSOR_WIDTH - 2 * GDX_CROP)
++#define GDX_CROP_HEIGHT (GDX_SENSOR_HEIGHT - 2 * GDX_CROP)
++
++/* Mean absolute difference to the background frame (12 bit units);
++ * empty-sensor noise is ~3, a finger gives 200-400. */
++#define GDX_FINGER_ON 50.0
++#define GDX_FINGER_OFF 25.0
++
++/* Band-pass "ridge energy" of a single frame (see gdx_ridge_energy()):
++* an empty sensor measures ~15, a finger 69-99. Used to make sure the
++* background really is an empty sensor, and that a touch has ridges. */
++#define GDX_RIDGE_CROP 4
++#define GDX_RIDGE_EMPTY 25.0
++#define GDX_RIDGE_FINGER 40.0
++#define GDX_CAPTURE_MAX 6
++#define GDX_POLL_DELAY 30
++#define GDX_IDLE_DELAY 200
++
++static const guint8 gdx_fdt_manual[] = {
++  0x0d, 0x01, 0x8b, 0x00, 0x84, 0x00, 0x8c, 0x00, 0x88, 0x00, 0x80, 0x96,
++  0x80, 0x91, 0x80, 0x92, 0x80, 0x85, 0x80, 0x8c, 0x80, 0x86,
++};
++
++static const guint8 gdx_image_request[] = {
++  0x01, 0x00, 0x8b, 0x00, 0x84, 0x00, 0x8c, 0x00, 0x88, 0x00,
++};
++
++typedef struct _FpiDeviceGoodix5201 FpiDeviceGoodix5201;
++
++typedef void (*GdxCmdCallback) (FpiDeviceGoodix5201 *self,
++                                const guint8        *payload,
++                                gsize                len,
++                                GError              *error);
++
++struct _FpiDeviceGoodix5201
++{
++  FpImageDevice       parent;
++
++  FpiImageDeviceState state;
++  FpiSsm             *act_ssm;
++  FpiSsm             *loop_ssm;
++  gboolean            loop_waiting;
++  gboolean            deactivating;
++
++  /* Command in flight */
++  guint8         cmd_byte;
++  gboolean       cmd_want_reply;
++  gboolean       cmd_awaiting_ack;
++  guint          cmd_reply_timeout;
++  GdxCmdCallback cmd_callback;
++
++  /* Message reassembly */
++  GByteArray *rx;
++  guint       rx_empty;
++  guint       drained;
++
++  guint16    *background;
++  gboolean    background_valid;
++  guint16    *frame;
++  guint16    *best;
++  double      best_score;
++  double      last_score;
++  guint       capture_frames;
++};
++
++G_DECLARE_FINAL_TYPE (FpiDeviceGoodix5201, fpi_device_goodix5201, FPI, DEVICE_GOODIX5201, FpImageDevice);
++G_DEFINE_TYPE (FpiDeviceGoodix5201, fpi_device_goodix5201, FP_TYPE_IMAGE_DEVICE);
++
++/*
++ * Image decoding
++ */
++
++static guint32
++gdx_crc32_mpeg2 (const guint8 *data, gsize len)
++{
++  guint32 crc = 0xffffffff;
++
++  for (gsize i = 0; i < len; i++)
++    {
++      crc ^= (guint32) data[i] << 24;
++      for (int b = 0; b < 8; b++)
++        crc = (crc & 0x80000000) ? (crc << 1) ^ 0x04c11db7 : crc << 1;
++    }
++
++  return crc;
++}
++
++/* Goodix stores 32 bit values as two big-endian 16 bit halves, low half first */
++static guint32
++gdx_decode_u32 (const guint8 *data)
++{
++  return data[0] * 0x100 + data[1] + data[2] * 0x1000000u + data[3] * 0x10000;
++}
++
++/* Goodix GEA stream cipher: XORs each little-endian 16 bit word with a
++ * keystream generated from a 32 bit key. */
++static void
++gdx_gea_decrypt (guint32 key, guint8 *data, gsize len)
++{
++  for (gsize i = 0; i + 1 < len; i += 2)
++    {
++      guint32 u3 = key >> 1 ^ key;
++      guint32 u2 = (((((((((key >> 0xf & 0x2000) | (key & 0x1000000)) >> 1 | (key & 0x20000)) >> 2
++                         | (key & 0x1000)) >> 3 | ((key >> 7 ^ key) & 0x80000)) >> 1
++                       | ((key >> 0xf ^ key) & 0x4000)) >> 2 | (key & 0x2000)) >> 2
++                     | (u3 & 0x40) | (key & 0x20)) >> 1
++                    | ((key >> 9 ^ key << 8) & 0x800) | ((key >> 0x14 ^ key * 2) & 4)
++                    | ((key * 8 ^ key >> 0x10) & 0x4000) | ((key >> 2 ^ key >> 0x10) & 0x80)
++                    | ((key << 6 ^ key >> 7) & 0x100) | ((key & 0x100) << 7));
++      guint32 u1 = key & 0xffff;
++      guint16 stream;
++      guint16 word;
++
++      key = (key ^ (u3 >> 0x14 ^ key) >> 10) << 0x1f | key >> 1;
++      stream = (guint16) (((u2 >> 8) & 0xffff) + ((u2 & 0xff) | (u1 & 1)) * 0x100);
++
++      word = (data[i] | data[i + 1] << 8) ^ stream;
++      data[i] = word & 0xff;
++      data[i + 1] = word >> 8;
++    }
++}
++
++/* 6 bytes -> 4 pixels of 12 bit */
++static void
++gdx_unpack_12bit (const guint8 *data, guint16 *pixels)
++{
++  for (gsize i = 0, p = 0; p < GDX_SENSOR_PIXELS; i += 6)
++    {
++      const guint8 *c = data + i;
++
++      pixels[p++] = ((c[0] & 0xf) << 8) + c[1];
++      pixels[p++] = (c[3] << 4) + (c[0] >> 4);
++      pixels[p++] = ((c[5] & 0xf) << 8) + c[2];
++      pixels[p++] = (c[4] << 4) + (c[5] >> 4);
++    }
++}
++
++static gboolean
++gdx_decode_frame (const guint8 *payload, gsize len, guint16 *pixels, GError **error)
++{
++  g_autofree guint8 *body = NULL;
++
++  if (len != GDX_IMAGE_HEADER + GDX_IMAGE_BYTES + GDX_IMAGE_CRC)
++    {
++      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                   "Unexpected image size %" G_GSIZE_FORMAT, len);
++      return FALSE;
++    }
++
++  if (gdx_crc32_mpeg2 (payload + GDX_IMAGE_HEADER, GDX_IMAGE_BYTES) !=
++      gdx_decode_u32 (payload + GDX_IMAGE_HEADER + GDX_IMAGE_BYTES))
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                           "Image CRC mismatch");
++      return FALSE;
++    }
++
++  body = g_memdup2 (payload + GDX_IMAGE_HEADER, GDX_IMAGE_BYTES);
++  gdx_gea_decrypt (GDX_GEA_KEY, body, GDX_IMAGE_BYTES);
++  gdx_unpack_12bit (body, pixels);
++
++  return TRUE;
++}
++
++static double
++gdx_frame_score (const guint16 *frame, const guint16 *background)
++{
++  guint64 sum = 0;
++
++  for (gsize i = 0; i < GDX_SENSOR_PIXELS; i++)
++    sum += ABS ((int) frame[i] - (int) background[i]);
++
++  return (double) sum / GDX_SENSOR_PIXELS;
++}
++
++static double
++gdx_box_mean (const double *integral, int w, int h, int x, int y, int r)
++{
++  int x0 = MAX (0, x - r), x1 = MIN (w, x + r + 1);
++  int y0 = MAX (0, y - r), y1 = MIN (h, y + r + 1);
++  double sum = integral[y1 * (w + 1) + x1] - integral[y0 * (w + 1) + x1] -
++               integral[y1 * (w + 1) + x0] + integral[y0 * (w + 1) + x0];
++
++  return sum / ((x1 - x0) * (y1 - y0));
++}
++
++/* Mean band-pass (3x3 minus 11x11 box blur) magnitude after removing the
++ * per-row offset. Pixel noise and row banding of the empty sensor cancel out,
++ * fingerprint ridges (period ~9 px) do not. */
++static double
++gdx_ridge_energy (const guint16 *frame)
++{
++  const int w = GDX_SENSOR_WIDTH - 2 * GDX_RIDGE_CROP;
++  const int h = GDX_SENSOR_HEIGHT - 2 * GDX_RIDGE_CROP;
++  g_autofree double *integral = g_new0 (double, (w + 1) * (h + 1));
++  double sum = 0;
++
++  for (int y = 0; y < h; y++)
++    {
++      const guint16 *row = frame + (y + GDX_RIDGE_CROP) * GDX_SENSOR_WIDTH + GDX_RIDGE_CROP;
++      double mean = 0, acc = 0;
++
++      for (int x = 0; x < w; x++)
++        mean += row[x];
++      mean /= w;
++
++      for (int x = 0; x < w; x++)
++        {
++          acc += row[x] - mean;
++          integral[(y + 1) * (w + 1) + x + 1] = integral[y * (w + 1) + x + 1] + acc;
++        }
++    }
++
++  for (int y = 0; y < h; y++)
++    for (int x = 0; x < w; x++)
++      sum += fabs (gdx_box_mean (integral, w, h, x, y, 1) -
++                   gdx_box_mean (integral, w, h, x, y, 5));
++
++  return sum / (w * h);
++}
++
++static int
++cmp_int (gconstpointer a, gconstpointer b)
++{
++  return *(const int *) a - *(const int *) b;
++}
++
++/* Background-subtracted, cropped and contrast-stretched 8 bit image.
++ * Ridges come out bright; SIGFM does not care about ridge polarity. */
++static FpImage *
++gdx_build_image (const guint16 *frame, const guint16 *background)
++{
++  g_autofree int *delta = g_new (int, GDX_CROP_WIDTH * GDX_CROP_HEIGHT);
++  g_autofree int *sorted = NULL;
++
++  g_autoptr(FpImage) img = NULL;
++  gsize n = GDX_CROP_WIDTH * GDX_CROP_HEIGHT;
++  int lo, hi;
++
++  for (int y = 0; y < GDX_CROP_HEIGHT; y++)
++    for (int x = 0; x < GDX_CROP_WIDTH; x++)
++      {
++        gsize src = (y + GDX_CROP) * GDX_SENSOR_WIDTH + x + GDX_CROP;
++
++        delta[y * GDX_CROP_WIDTH + x] = (int) background[src] - (int) frame[src];
++      }
++
++  sorted = g_memdup2 (delta, n * sizeof (int));
++  qsort (sorted, n, sizeof (int), cmp_int);
++  lo = sorted[n / 100];
++  hi = sorted[n - 1 - n / 100];
++  if (hi <= lo)
++    hi = lo + 1;
++
++  img = fp_image_new (GDX_CROP_WIDTH, GDX_CROP_HEIGHT);
++  for (gsize i = 0; i < n; i++)
++    img->data[i] = CLAMP ((delta[i] - lo) * 255 / (hi - lo), 0, 255);
++  img->flags = FPI_IMAGE_PARTIAL;
++
++  return g_steal_pointer (&img);
++}
++
++/*
++ * Transport: send a message, wait for its ACK, optionally wait for the reply
++ * carrying the same command byte.
++ */
++
++static void gdx_read_chunk (FpiDeviceGoodix5201 *self,
++                            guint                timeout);
++static void gdx_start_receive (FpiDeviceGoodix5201 *self,
++                               guint                timeout);
++
++static void
++gdx_cmd_done (FpiDeviceGoodix5201 *self, const guint8 *payload, gsize len, GError *error)
++{
++  GdxCmdCallback callback = self->cmd_callback;
++
++  self->cmd_callback = NULL;
++  g_return_if_fail (callback != NULL);
++  callback (self, payload, len, error);
++}
++
++static void
++gdx_message_received (FpiDeviceGoodix5201 *self)
++{
++  const guint8 *data = self->rx->data;
++  gsize total = self->rx->len;
++  guint8 checksum = 0xaa;
++  const guint8 *payload = data + 3;
++  gsize payload_len;
++
++  /* Header (3) + checksum (1) */
++  if (total < 4)
++    {
++      gdx_cmd_done (self, NULL, 0,
++                    fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                              "Truncated message 0x%02x", data[0]));
++      return;
++    }
++  payload_len = total - 4;
++
++  for (gsize i = 0; i < total - 1; i++)
++    checksum -= data[i];
++
++  if (data[total - 1] != 0x88 && data[total - 1] != checksum)
++    {
++      gdx_cmd_done (self, NULL, 0,
++                    fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                              "Bad checksum in message 0x%02x", data[0]));
++      return;
++    }
++
++  if (self->cmd_awaiting_ack)
++    {
++      if (data[0] != GDX_CMD_ACK || payload_len < 1 || payload[0] != self->cmd_byte)
++        {
++          gdx_cmd_done (self, NULL, 0,
++                        fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                  "Expected ACK for 0x%02x, got 0x%02x",
++                                                  self->cmd_byte, data[0]));
++          return;
++        }
++
++      self->cmd_awaiting_ack = FALSE;
++      if (self->cmd_want_reply)
++        {
++          gdx_start_receive (self, self->cmd_reply_timeout);
++          return;
++        }
++
++      gdx_cmd_done (self, NULL, 0, NULL);
++      return;
++    }
++
++  if (data[0] != self->cmd_byte)
++    {
++      gdx_cmd_done (self, NULL, 0,
++                    fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                              "Expected reply 0x%02x, got 0x%02x",
++                                              self->cmd_byte, data[0]));
++      return;
++    }
++
++  gdx_cmd_done (self, payload, payload_len, NULL);
++}
++
++static void
++gdx_read_chunk_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
++{
++  FpiDeviceGoodix5201 *self = FPI_DEVICE_GOODIX5201 (dev);
++  guint timeout = GPOINTER_TO_UINT (user_data);
++  const guint8 *buf = transfer->buffer;
++  gsize len = transfer->actual_length;
++  gsize expected;
++
++  if (error)
++    {
++      gdx_cmd_done (self, NULL, 0, error);
++      return;
++    }
++
++  /* The device occasionally sends zero-length packets */
++  if (len == 0)
++    {
++      if (++self->rx_empty > GDX_MAX_EMPTY)
++        {
++          gdx_cmd_done (self, NULL, 0,
++                        fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "Too many empty reads"));
++          return;
++        }
++      gdx_read_chunk (self, timeout);
++      return;
++    }
++
++  if (self->rx->len == 0)
++    {
++      if (len < 3)
++        {
++          gdx_cmd_done (self, NULL, 0,
++                        fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "Short message header"));
++          return;
++        }
++      g_byte_array_append (self->rx, buf, len);
++    }
++  else
++    {
++      if (buf[0] != (self->rx->data[0] | 1))
++        {
++          gdx_cmd_done (self, NULL, 0,
++                        fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                  "Bad continuation chunk 0x%02x", buf[0]));
++          return;
++        }
++      g_byte_array_append (self->rx, buf + 1, len - 1);
++    }
++
++  expected = 3 + (self->rx->data[1] | self->rx->data[2] << 8);
++  if (self->rx->len < expected)
++    {
++      gdx_read_chunk (self, timeout);
++      return;
++    }
++
++  g_byte_array_set_size (self->rx, expected);
++  gdx_message_received (self);
++}
++
++static void
++gdx_read_chunk (FpiDeviceGoodix5201 *self, guint timeout)
++{
++  FpiUsbTransfer *transfer = fpi_usb_transfer_new (FP_DEVICE (self));
++
++  fpi_usb_transfer_fill_bulk (transfer, GDX_EP_IN, GDX_CHUNK);
++  fpi_usb_transfer_submit (transfer, timeout, NULL, gdx_read_chunk_cb, GUINT_TO_POINTER (timeout));
++}
++
++static void
++gdx_start_receive (FpiDeviceGoodix5201 *self, guint timeout)
++{
++  g_byte_array_set_size (self->rx, 0);
++  self->rx_empty = 0;
++  gdx_read_chunk (self, timeout);
++}
++
++static void
++gdx_write_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
++{
++  FpiDeviceGoodix5201 *self = FPI_DEVICE_GOODIX5201 (dev);
++
++  if (error)
++    {
++      gdx_cmd_done (self, NULL, 0, error);
++      return;
++    }
++
++  gdx_start_receive (self, GDX_ACK_TIMEOUT);
++}
++
++static void
++gdx_cmd (FpiDeviceGoodix5201 *self,
++         guint8               cmd_byte,
++         const guint8        *payload,
++         gsize                len,
++         gboolean             want_reply,
++         guint                reply_timeout,
++         GdxCmdCallback       callback)
++{
++  g_autoptr(GByteArray) msg = g_byte_array_new ();
++  FpiUsbTransfer *transfer;
++  guint8 header[3] = { cmd_byte, (len + 1) & 0xff, (len + 1) >> 8 };
++  guint8 checksum = 0xaa;
++  guint8 *out;
++  gsize out_len, pos = 0, src = 0;
++
++  g_return_if_fail (self->cmd_callback == NULL);
++
++  self->cmd_byte = cmd_byte;
++  self->cmd_want_reply = want_reply;
++  self->cmd_awaiting_ack = TRUE;
++  self->cmd_reply_timeout = reply_timeout;
++  self->cmd_callback = callback;
++
++  g_byte_array_append (msg, header, sizeof (header));
++  if (len)
++    g_byte_array_append (msg, payload, len);
++  for (guint i = 0; i < msg->len; i++)
++    checksum -= msg->data[i];
++  g_byte_array_append (msg, &checksum, 1);
++
++  /* First chunk carries the message start, following chunks are prefixed
++   * with cmd_byte | 1. Every chunk is padded to the full packet size. */
++  out_len = GDX_CHUNK;
++  if (msg->len > GDX_CHUNK)
++    out_len += ((msg->len - GDX_CHUNK) + GDX_CHUNK - 2) / (GDX_CHUNK - 1) * GDX_CHUNK;
++  out = g_malloc0 (out_len);
++
++  while (src < msg->len)
++    {
++      gsize room = GDX_CHUNK;
++
++      if (pos > 0)
++        {
++          out[pos] = cmd_byte | 1;
++          room--;
++        }
++      memcpy (out + pos + (GDX_CHUNK - room), msg->data + src, MIN (room, msg->len - src));
++      src += MIN (room, msg->len - src);
++      pos += GDX_CHUNK;
++    }
++
++  transfer = fpi_usb_transfer_new (FP_DEVICE (self));
++  fpi_usb_transfer_fill_bulk_full (transfer, GDX_EP_OUT, out, out_len, g_free);
++  fpi_usb_transfer_submit (transfer, GDX_ACK_TIMEOUT, NULL, gdx_write_cb, NULL);
++}
++
++/*
++ * Activation: bring up the sensor and record a background frame
++ */
++
++enum activate_states {
++  ACT_DRAIN,
++  ACT_PING,
++  ACT_FIRMWARE,
++  ACT_RESET,
++  ACT_CONFIG,
++  ACT_DRV_STATE_1,
++  ACT_DRV_STATE_2,
++  ACT_FDT_MANUAL,
++  ACT_BACKGROUND,
++  ACT_NUM_STATES,
++};
++
++static void
++act_step_cb (FpiDeviceGoodix5201 *self, const guint8 *payload, gsize len, GError *error)
++{
++  FpiSsm *ssm = self->act_ssm;
++
++  if (error)
++    fpi_ssm_mark_failed (ssm, error);
++  else
++    fpi_ssm_next_state (ssm);
++}
++
++static void act_drain (FpiDeviceGoodix5201 *self);
++
++static void
++act_drain_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
++{
++  FpiDeviceGoodix5201 *self = FPI_DEVICE_GOODIX5201 (dev);
++
++  if (error)
++    {
++      if (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
++        {
++          g_error_free (error);
++          fpi_ssm_next_state (self->act_ssm);
++        }
++      else
++        {
++          fpi_ssm_mark_failed (self->act_ssm, error);
++        }
++      return;
++    }
++
++  /* A zero length read also ends draining; this is how a timeout shows up
++   * when the device is emulated by umockdev. */
++  fp_dbg ("Discarded %" G_GSSIZE_FORMAT " bytes of stale input", transfer->actual_length);
++  if (transfer->actual_length == 0 || ++self->drained >= GDX_DRAIN_MAX)
++    {
++      fpi_ssm_next_state (self->act_ssm);
++      return;
++    }
++  act_drain (self);
++}
++
++static void
++act_drain (FpiDeviceGoodix5201 *self)
++{
++  FpiUsbTransfer *transfer = fpi_usb_transfer_new (FP_DEVICE (self));
++
++  fpi_usb_transfer_fill_bulk (transfer, GDX_EP_IN, GDX_CHUNK);
++  fpi_usb_transfer_submit (transfer, GDX_DRAIN_TIMEOUT, NULL, act_drain_cb, NULL);
++}
++
++static void
++act_firmware_cb (FpiDeviceGoodix5201 *self, const guint8 *payload, gsize len, GError *error)
++{
++  FpiSsm *ssm = self->act_ssm;
++  g_autofree gchar *version = NULL;
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  version = g_strndup ((const gchar *) payload, len);
++  fp_dbg ("Firmware version: %s", version);
++  if (!strstr (version, GDX_FIRMWARE_MATCH))
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                                          "Unsupported firmware %s", version));
++      return;
++    }
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++act_config_cb (FpiDeviceGoodix5201 *self, const guint8 *payload, gsize len, GError *error)
++{
++  FpiSsm *ssm = self->act_ssm;
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++  if (len < 1 || payload[0] != 1)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "Sensor rejected configuration"));
++      return;
++    }
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++act_background_cb (FpiDeviceGoodix5201 *self, const guint8 *payload, gsize len, GError *error)
++{
++  FpiSsm *ssm = self->act_ssm;
++
++  if (error || !gdx_decode_frame (payload, len, self->background, &error))
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  /* A finger may still rest on the sensor (e.g. verify started right after
++   * enrolling); the capture loop then waits for an empty frame instead. */
++  self->background_valid = gdx_ridge_energy (self->background) < GDX_RIDGE_EMPTY;
++  if (!self->background_valid)
++    fp_dbg ("Sensor not empty at activation, waiting for the finger to be lifted");
++
++  fpi_ssm_next_state (ssm);
++}
++
++static void
++activate_run_state (FpiSsm *ssm, FpDevice *dev)
++{
++  FpiDeviceGoodix5201 *self = FPI_DEVICE_GOODIX5201 (dev);
++  static const guint8 zero2[] = { 0x00, 0x00 };
++  static const guint8 reset_sensor[] = { 0x01, 20 };
++  static const guint8 drv_state[] = { 0x01, 0x00 };
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case ACT_DRAIN:
++      self->drained = 0;
++      act_drain (self);
++      break;
++
++    case ACT_PING:
++      gdx_cmd (self, GDX_CMD_PING, zero2, sizeof (zero2), FALSE, 0, act_step_cb);
++      break;
++
++    case ACT_FIRMWARE:
++      gdx_cmd (self, GDX_CMD_FIRMWARE, zero2, sizeof (zero2), TRUE, GDX_REPLY_TIMEOUT,
++               act_firmware_cb);
++      break;
++
++    case ACT_RESET:
++      gdx_cmd (self, GDX_CMD_RESET, reset_sensor, sizeof (reset_sensor), FALSE, 0, act_step_cb);
++      break;
++
++    case ACT_CONFIG:
++      gdx_cmd (self, GDX_CMD_CONFIG, goodix5201_config, sizeof (goodix5201_config),
++               TRUE, GDX_REPLY_TIMEOUT, act_config_cb);
++      break;
++
++    case ACT_DRV_STATE_1:
++    case ACT_DRV_STATE_2:
++      gdx_cmd (self, GDX_CMD_DRV_STATE, drv_state, sizeof (drv_state), FALSE, 0, act_step_cb);
++      break;
++
++    case ACT_FDT_MANUAL:
++      gdx_cmd (self, GDX_CMD_FDT_MANUAL, gdx_fdt_manual, sizeof (gdx_fdt_manual),
++               TRUE, GDX_REPLY_TIMEOUT, act_step_cb);
++      break;
++
++    case ACT_BACKGROUND:
++      gdx_cmd (self, GDX_CMD_IMAGE, gdx_image_request, sizeof (gdx_image_request),
++               TRUE, GDX_IMAGE_TIMEOUT, act_background_cb);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++/*
++ * Capture loop: poll frames and compare them to the background
++ */
++
++enum loop_states {
++  LOOP_CAPTURE,
++  LOOP_NUM_STATES,
++};
++
++static void
++loop_frame_cb (FpiDeviceGoodix5201 *self, const guint8 *payload, gsize len, GError *error)
++{
++  FpImageDevice *idev = FP_IMAGE_DEVICE (self);
++  FpiSsm *ssm = self->loop_ssm;
++  double score, ridge;
++  gboolean empty;
++  int delay = GDX_POLL_DELAY;
++
++  if (error || !gdx_decode_frame (payload, len, self->frame, &error))
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  ridge = gdx_ridge_energy (self->frame);
++  empty = ridge < GDX_RIDGE_EMPTY;
++
++  /* The background must be an empty-sensor frame. Acquire it once the sensor
++   * is empty, and keep refreshing it while waiting for a finger so that it
++   * follows slow sensor drift. */
++  if (empty && (!self->background_valid || self->state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON))
++    {
++      if (!self->background_valid)
++        fp_dbg ("Background acquired (ridge %.1f)", ridge);
++      memcpy (self->background, self->frame, GDX_SENSOR_PIXELS * sizeof (guint16));
++      self->background_valid = TRUE;
++    }
++
++  if (!self->background_valid)
++    {
++      self->loop_waiting = TRUE;
++      fpi_ssm_jump_to_state_delayed (ssm, LOOP_CAPTURE, GDX_POLL_DELAY);
++      return;
++    }
++
++  score = gdx_frame_score (self->frame, self->background);
++
++  switch (self->state)
++    {
++    case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON:
++      if (score > GDX_FINGER_ON && ridge > GDX_RIDGE_FINGER)
++        {
++          fp_dbg ("Finger on (score %.1f, ridge %.1f)", score, ridge);
++          memcpy (self->best, self->frame, GDX_SENSOR_PIXELS * sizeof (guint16));
++          self->best_score = score;
++          self->last_score = score;
++          self->capture_frames = 1;
++          fpi_image_device_report_finger_status (idev, TRUE);
++          delay = 0;
++        }
++      break;
++
++    case FPI_IMAGE_DEVICE_STATE_CAPTURE:
++      {
++        /* Finger pressure keeps building for a few frames; take the frame
++         * once the signal stops growing. */
++        gboolean settled = score < self->last_score * 1.03;
++
++        self->capture_frames++;
++        if (score > self->best_score)
++          {
++            memcpy (self->best, self->frame, GDX_SENSOR_PIXELS * sizeof (guint16));
++            self->best_score = score;
++          }
++        self->last_score = score;
++
++        fp_dbg ("Capture frame %u score %.1f ridge %.1f", self->capture_frames, score, ridge);
++        if (score < GDX_FINGER_OFF || empty)
++          {
++            fpi_image_device_retry_scan (idev, FP_DEVICE_RETRY_TOO_SHORT);
++          }
++        else if (settled || self->capture_frames >= GDX_CAPTURE_MAX)
++          {
++            fp_dbg ("Captured image (score %.1f)", self->best_score);
++            fpi_image_device_image_captured (idev, gdx_build_image (self->best, self->background));
++          }
++        delay = 0;
++      }
++      break;
++
++    case FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF:
++      if (score < GDX_FINGER_OFF || empty)
++        {
++          fp_dbg ("Finger off (score %.1f, ridge %.1f)", score, ridge);
++          fpi_image_device_report_finger_status (idev, FALSE);
++        }
++      break;
++
++    case FPI_IMAGE_DEVICE_STATE_INACTIVE:
++    case FPI_IMAGE_DEVICE_STATE_ACTIVATING:
++    case FPI_IMAGE_DEVICE_STATE_DEACTIVATING:
++    case FPI_IMAGE_DEVICE_STATE_IDLE:
++      delay = GDX_IDLE_DELAY;
++      break;
++    }
++
++  self->loop_waiting = TRUE;
++  fpi_ssm_jump_to_state_delayed (ssm, LOOP_CAPTURE, delay);
++}
++
++static void
++loop_run_state (FpiSsm *ssm, FpDevice *dev)
++{
++  FpiDeviceGoodix5201 *self = FPI_DEVICE_GOODIX5201 (dev);
++
++  self->loop_waiting = FALSE;
++  if (self->deactivating)
++    {
++      fpi_ssm_mark_completed (ssm);
++      return;
++    }
++
++  gdx_cmd (self, GDX_CMD_IMAGE, gdx_image_request, sizeof (gdx_image_request),
++           TRUE, GDX_IMAGE_TIMEOUT, loop_frame_cb);
++}
++
++static void
++sleep_done_cb (FpiDeviceGoodix5201 *self, const guint8 *payload, gsize len, GError *error)
++{
++  if (error)
++    {
++      fp_dbg ("Failed to put sensor to sleep: %s", error->message);
++      g_error_free (error);
++    }
++  fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (self), NULL);
++}
++
++static void
++gdx_sleep_and_deactivate (FpiDeviceGoodix5201 *self)
++{
++  static const guint8 sleep_mode[] = { 0x01, 0x00 };
++
++  gdx_cmd (self, GDX_CMD_SLEEP, sleep_mode, sizeof (sleep_mode), FALSE, 0, sleep_done_cb);
++}
++
++static void
++loop_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  FpiDeviceGoodix5201 *self = FPI_DEVICE_GOODIX5201 (dev);
++
++  self->loop_ssm = NULL;
++  self->loop_waiting = FALSE;
++
++  if (error)
++    {
++      if (self->deactivating)
++        {
++          g_error_free (error);
++          fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (dev), NULL);
++        }
++      else
++        {
++          fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
++        }
++      return;
++    }
++
++  gdx_sleep_and_deactivate (self);
++}
++
++static void
++activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  FpiDeviceGoodix5201 *self = FPI_DEVICE_GOODIX5201 (dev);
++
++  self->act_ssm = NULL;
++  fpi_image_device_activate_complete (FP_IMAGE_DEVICE (dev), error);
++  if (error)
++    return;
++
++  /* Deactivation was requested while we were still bringing up the sensor */
++  if (self->deactivating)
++    {
++      gdx_sleep_and_deactivate (self);
++      return;
++    }
++
++  self->loop_ssm = fpi_ssm_new (dev, loop_run_state, LOOP_NUM_STATES);
++  fpi_ssm_start (self->loop_ssm, loop_complete);
++}
++
++static void
++dev_activate (FpImageDevice *idev)
++{
++  FpiDeviceGoodix5201 *self = FPI_DEVICE_GOODIX5201 (idev);
++  FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (idev), activate_run_state, ACT_NUM_STATES);
++
++  self->deactivating = FALSE;
++  self->background_valid = FALSE;
++  self->state = FPI_IMAGE_DEVICE_STATE_ACTIVATING;
++  self->act_ssm = ssm;
++  fpi_ssm_start (ssm, activate_complete);
++}
++
++static void
++dev_change_state (FpImageDevice *idev, FpiImageDeviceState state)
++{
++  FpiDeviceGoodix5201 *self = FPI_DEVICE_GOODIX5201 (idev);
++
++  fp_dbg ("State change %d", state);
++  self->state = state;
++}
++
++static void
++dev_deactivate (FpImageDevice *idev)
++{
++  FpiDeviceGoodix5201 *self = FPI_DEVICE_GOODIX5201 (idev);
++
++  /* This may be called synchronously from within our own callbacks (e.g.
++   * through fpi_image_device_retry_scan()), so only flag the request here.
++   * The capture loop (or the activation completion) finishes the job. */
++  self->deactivating = TRUE;
++
++  if (self->act_ssm)
++    return;
++
++  if (!self->loop_ssm)
++    {
++      fpi_image_device_deactivate_complete (idev, NULL);
++      return;
++    }
++
++  /* Idle between polls: don't wait for the poll delay to expire */
++  if (self->loop_waiting)
++    {
++      fpi_ssm_cancel_delayed_state_change (self->loop_ssm);
++      fpi_ssm_jump_to_state (self->loop_ssm, LOOP_CAPTURE);
++    }
++}
++
++/*
++ * Open / close
++ */
++
++static GUsbDeviceClaimInterfaceFlags
++gdx_claim_flags (FpDevice *dev)
++{
++  /* umockdev cannot emulate detaching the cdc_acm kernel driver */
++  if (fpi_device_emulation_mode_enabled (dev))
++    return 0;
++
++  return G_USB_DEVICE_CLAIM_INTERFACE_BIND_KERNEL_DRIVER;
++}
++
++static void
++dev_open (FpImageDevice *idev)
++{
++  GUsbDevice *usb = fpi_device_get_usb_device (FP_DEVICE (idev));
++  GError *error = NULL;
++
++  /* The device enumerates as a CDC ACM modem and cdc_acm binds to it;
++   * detaching it from the communication interface releases both. */
++  if (g_usb_device_claim_interface (usb, GDX_IFACE_COMM, gdx_claim_flags (FP_DEVICE (idev)), &error) &&
++      !g_usb_device_claim_interface (usb, GDX_IFACE_DATA, 0, &error))
++    g_usb_device_release_interface (usb, GDX_IFACE_COMM, gdx_claim_flags (FP_DEVICE (idev)), NULL);
++
++  fpi_image_device_open_complete (idev, error);
++}
++
++static void
++dev_close (FpImageDevice *idev)
++{
++  GUsbDevice *usb = fpi_device_get_usb_device (FP_DEVICE (idev));
++  GError *error = NULL;
++
++  g_usb_device_release_interface (usb, GDX_IFACE_DATA, 0, NULL);
++  g_usb_device_release_interface (usb, GDX_IFACE_COMM, gdx_claim_flags (FP_DEVICE (idev)), &error);
++
++  fpi_image_device_close_complete (idev, error);
++}
++
++static const FpIdEntry id_table[] = {
++  { .vid = 0x27c6, .pid = 0x5201, },
++  { .vid = 0,      .pid = 0, },
++};
++
++static void
++fpi_device_goodix5201_init (FpiDeviceGoodix5201 *self)
++{
++  self->rx = g_byte_array_new ();
++  self->background = g_new0 (guint16, GDX_SENSOR_PIXELS);
++  self->frame = g_new0 (guint16, GDX_SENSOR_PIXELS);
++  self->best = g_new0 (guint16, GDX_SENSOR_PIXELS);
++}
++
++static void
++fpi_device_goodix5201_finalize (GObject *object)
++{
++  FpiDeviceGoodix5201 *self = FPI_DEVICE_GOODIX5201 (object);
++
++  g_byte_array_unref (self->rx);
++  g_free (self->background);
++  g_free (self->frame);
++  g_free (self->best);
++
++  G_OBJECT_CLASS (fpi_device_goodix5201_parent_class)->finalize (object);
++}
++
++static void
++fpi_device_goodix5201_class_init (FpiDeviceGoodix5201Class *klass)
++{
++  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
++  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
++
++  dev_class->id = "goodix5201";
++  dev_class->full_name = "Goodix Fingerprint Sensor 27c6:5201";
++  dev_class->type = FP_DEVICE_TYPE_USB;
++  dev_class->id_table = id_table;
++  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++  /* Each press only covers ~5x4 mm of the finger; record many of them */
++  dev_class->nr_enroll_stages = 15;
++
++  img_class->img_open = dev_open;
++  img_class->img_close = dev_close;
++  img_class->activate = dev_activate;
++  img_class->deactivate = dev_deactivate;
++  img_class->change_state = dev_change_state;
++
++  img_class->img_width = GDX_CROP_WIDTH;
++  img_class->img_height = GDX_CROP_HEIGHT;
++
++  /* NBIS finds only 2-3 genuine minutiae on these small images, far too few
++   * for bozorth3. With SIGFM, same-finger scores were measured at 132 and
++   * above and scores against other fingers at 3 or below. */
++  img_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
++  img_class->score_threshold = 40;
++
++  G_OBJECT_CLASS (klass)->finalize = fpi_device_goodix5201_finalize;
++}
+diff --git a/libfprint/drivers/goodix5201.h b/libfprint/drivers/goodix5201.h
+new file mode 100644
+index 00000000..c862068b
+--- /dev/null
++++ b/libfprint/drivers/goodix5201.h
+@@ -0,0 +1,34 @@
++/*
++ * Goodix 27c6:5201 sensor configuration
++ *
++ * 256-byte sensor register configuration uploaded to the MCU (volatile) on
++ * every activation. Taken from the vendor Windows driver (milanFusb.dll
++ * v1.0.20.1300, offset 0x2F140); the trailing 16-bit checksum is recomputed
++ * as 0x10000 - (0xA5A5 + sum of preceding LE u16 words).
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++static const guint8 goodix5201_config[256] = {
++  0x08, 0x11, 0x54, 0x65, 0x24, 0x89, 0x24, 0xad, 0x1c, 0xc9, 0x1c, 0xe5, 0x04, 0xe9, 0x04, 0xed,
++  0x13, 0xba, 0x00, 0x01, 0x00, 0xca, 0x00, 0x07, 0x00, 0x84, 0x00, 0x80, 0x81, 0x86, 0x00, 0x80,
++  0x8c, 0x88, 0x00, 0x80, 0x97, 0x8a, 0x00, 0x80, 0xb0, 0x8c, 0x00, 0x80, 0x86, 0x8e, 0x00, 0x80,
++  0x8c, 0x90, 0x00, 0x80, 0xa0, 0x92, 0x00, 0x80, 0xb3, 0x94, 0x00, 0x80, 0x84, 0x96, 0x00, 0x80,
++  0x88, 0x98, 0x00, 0x80, 0xa0, 0x9a, 0x00, 0x80, 0xb8, 0x56, 0x00, 0x08, 0x28, 0x58, 0x00, 0x48,
++  0x00, 0x70, 0x00, 0x01, 0x00, 0x72, 0x00, 0x78, 0x56, 0x74, 0x00, 0x34, 0x12, 0x26, 0x00, 0x00,
++  0x12, 0xd0, 0x00, 0x00, 0x00, 0x20, 0x01, 0x02, 0x04, 0x20, 0x00, 0x10, 0x40, 0x22, 0x00, 0x01,
++  0x20, 0x24, 0x00, 0x32, 0x00, 0x80, 0x00, 0x01, 0x04, 0x5c, 0x00, 0x80, 0x00, 0x28, 0x02, 0x00,
++  0x00, 0x2a, 0x02, 0x00, 0x00, 0x82, 0x00, 0x80, 0x15, 0x20, 0x01, 0x82, 0x04, 0x20, 0x00, 0x10,
++  0x40, 0x22, 0x00, 0x01, 0x20, 0x24, 0x00, 0x14, 0x00, 0x80, 0x00, 0x01, 0x04, 0x5c, 0x00, 0x00,
++  0x01, 0x28, 0x02, 0x00, 0x00, 0x2a, 0x02, 0x00, 0x00, 0x82, 0x00, 0x80, 0x15, 0x20, 0x01, 0x08,
++  0x04, 0x22, 0x00, 0x10, 0x08, 0x80, 0x00, 0x01, 0x00, 0x5c, 0x00, 0x80, 0x00, 0x28, 0x02, 0x00,
++  0x00, 0x2a, 0x02, 0x00, 0x00, 0x82, 0x00, 0x80, 0x15, 0x20, 0x01, 0x08, 0x04, 0x5c, 0x00, 0x80,
++  0x00, 0x50, 0x00, 0x01, 0x05, 0x52, 0x00, 0x08, 0x00, 0x54, 0x00, 0x10, 0x01, 0x28, 0x02, 0x00,
++  0x00, 0x2a, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6b, 0x9f,
++};
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index b0c909cc..fab13437 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -130,6 +130,7 @@ driver_sources = {
+         'drivers/synaptics/synaptics.c',
+         'drivers/synaptics/bmkt_message.c',
+     ),
++    'goodix5201' : files('drivers/goodix5201.c'),
+     'goodixmoc' : files(
+         'drivers/goodixmoc/goodix.c',
+         'drivers/goodixmoc/goodix_proto.c',
+diff --git a/meson.build b/meson.build
+index 9ef8c05f..75fede09 100644
+--- a/meson.build
++++ b/meson.build
+@@ -141,6 +141,7 @@ drivers_info = {
+     'upektc': {},
+     'upeksonly': {},
+     'upekts': {},
++    'goodix5201': {},
+     'goodixmoc': {},
+     'nb1010': {},
+     'fpcmoc': {},
+-- 
+2.55.0
+

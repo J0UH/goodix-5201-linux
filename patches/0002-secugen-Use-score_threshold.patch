@@ -1,0 +1,26 @@
+From 9059454e21c6e102220b51b0593be33bdf01bf47 Mon Sep 17 00:00:00 2001
+From: "Jodi U. H." <217747670+J0UH@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 01:15:06 +0200
+Subject: [PATCH 2/4] secugen: Use score_threshold
+
+The SIGFM changes renamed bz3_threshold to score_threshold.
+---
+ libfprint/drivers/secugen.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libfprint/drivers/secugen.c b/libfprint/drivers/secugen.c
+index 37a3c17f..dd4abd64 100644
+--- a/libfprint/drivers/secugen.c
++++ b/libfprint/drivers/secugen.c
+@@ -2338,7 +2338,7 @@ fpi_device_secugen_class_init (FpiDeviceSecugenClass *klass)
+   img_class->deactivate = dev_deactivate;
+   img_class->change_state = dev_change_state;
+ 
+-  img_class->bz3_threshold = 24;
++  img_class->score_threshold = 24;
+ 
+   img_class->img_width = SECUGEN_IMG_WIDTH;
+   img_class->img_height = SECUGEN_IMG_HEIGHT;
+-- 
+2.55.0
+

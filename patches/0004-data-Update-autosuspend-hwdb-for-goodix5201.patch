@@ -1,0 +1,51 @@
+From 2c91785938d1a821c5f9d47caf3afab8627affc5 Mon Sep 17 00:00:00 2001
+From: "Jodi U. H." <217747670+J0UH@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 01:15:06 +0200
+Subject: [PATCH 4/4] data: Update autosuspend hwdb for goodix5201
+
+Move 27c6:5201 from the list of unsupported devices to the goodix5201
+driver.
+---
+ data/autosuspend.hwdb             | 6 +++++-
+ libfprint/fprint-list-udev-hwdb.c | 1 -
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
+index 104ce5e6..56be9a77 100644
+--- a/data/autosuspend.hwdb
++++ b/data/autosuspend.hwdb
+@@ -216,6 +216,11 @@ usb:v10A5p9B24*
+  ID_AUTOSUSPEND=1
+  ID_PERSIST=0
+ 
++# Supported by libfprint driver goodix5201
++usb:v27C6p5201*
++ ID_AUTOSUSPEND=1
++ ID_PERSIST=0
++
+ # Supported by libfprint driver goodixmoc
+ usb:v27C6p5840*
+ usb:v27C6p6014*
+@@ -519,7 +524,6 @@ usb:v27C6p5110*
+ usb:v27C6p5117*
+ usb:v27C6p5120*
+ usb:v27C6p5125*
+-usb:v27C6p5201*
+ usb:v27C6p521D*
+ usb:v27C6p5301*
+ usb:v27C6p530C*
+diff --git a/libfprint/fprint-list-udev-hwdb.c b/libfprint/fprint-list-udev-hwdb.c
+index 539f3e69..ada80265 100644
+--- a/libfprint/fprint-list-udev-hwdb.c
++++ b/libfprint/fprint-list-udev-hwdb.c
+@@ -161,7 +161,6 @@ static const FpIdEntry allowlist_id_table[] = {
+   { .vid = 0x27c6, .pid = 0x5117 },
+   { .vid = 0x27c6, .pid = 0x5120 },
+   { .vid = 0x27c6, .pid = 0x5125 },
+-  { .vid = 0x27c6, .pid = 0x5201 },
+   { .vid = 0x27c6, .pid = 0x521d },
+   { .vid = 0x27c6, .pid = 0x5301 },
+   { .vid = 0x27c6, .pid = 0x530c },
+-- 
+2.55.0
+

@@ -1,0 +1,39 @@
+From 54eefe479ba890a4199d569135202998e024eac8 Mon Sep 17 00:00:00 2001
+From: "Jodi U. H." <217747670+J0UH@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 01:15:06 +0200
+Subject: [PATCH 1/4] sigfm: Accept OpenCV 5 and make doctest optional
+
+OpenCV 5 installs its pkg-config module as opencv5, so look for that
+before falling back to opencv4. doctest is only needed to build the SIGFM
+unit tests, so only build them when it is available.
+---
+ libfprint/sigfm/meson.build | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/libfprint/sigfm/meson.build b/libfprint/sigfm/meson.build
+index 354d943d..9199705f 100644
+--- a/libfprint/sigfm/meson.build
++++ b/libfprint/sigfm/meson.build
+@@ -1,11 +1,15 @@
+-
+ sigfm_sources = ['sigfm.cpp']
+ 
+-opencv = dependency('opencv4', required: true)
+-doctest = dependency('doctest', required: true)
++# OpenCV 5 renamed the pkg-config module, accept both
++opencv = dependency('opencv5', 'opencv4', required: true)
++# doctest is only needed for the SIGFM unit tests
++doctest = dependency('doctest', required: false)
+ 
+ libsigfm = static_library('sigfm',
+         sigfm_sources,
+         dependencies: [opencv],
+ )
+-sigfm_tests = executable('sigfm-tests', ['./tests.cpp'], dependencies: [doctest, opencv], link_with: [libsigfm])
++
++if doctest.found()
++    sigfm_tests = executable('sigfm-tests', ['./tests.cpp'], dependencies: [doctest, opencv], link_with: [libsigfm])
++endif
+-- 
+2.55.0
+
