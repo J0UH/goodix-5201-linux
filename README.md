@@ -168,7 +168,7 @@ and matched with SIGFM.
 |---|---|
 | [`libfprint` branch](https://github.com/J0UH/goodix-5201-linux/tree/libfprint) | Buildable libfprint: upstream + SIGFM (MR !530) + the driver |
 | [`patches/`](patches) | The driver commits as patches, for review |
-| [`packaging/arch/`](packaging/arch) | Arch Linux package (same as the AUR package) |
+| [`packaging/arch/`](packaging/arch) | Arch Linux package (will also be the AUR package) |
 | [`tools/`](tools) | Python reference implementation and research tools |
 | [`docs/`](docs) | Documentation |
 
