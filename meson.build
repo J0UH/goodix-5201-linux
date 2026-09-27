@@ -141,6 +141,7 @@ drivers_info = {
     'upektc': {},
     'upeksonly': {},
     'upekts': {},
+    'goodix5201': {},
     'goodixmoc': {},
     'nb1010': {},
     'fpcmoc': {},
