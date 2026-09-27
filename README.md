@@ -39,14 +39,7 @@ If you have it in another laptop, please open an issue so it can be added.
 
 ### Arch Linux, Omarchy
 
-Install [`libfprint-goodix-5201`](https://aur.archlinux.org/packages/libfprint-goodix-5201)
-from the AUR, together with fprintd:
-
-```sh
-yay -S libfprint-goodix-5201 fprintd
-```
-
-It replaces the `libfprint` (or `libfprint-git`) package. Without an AUR helper:
+Build and install the package from this repository, together with fprintd:
 
 ```sh
 git clone https://github.com/J0UH/goodix-5201-linux.git
@@ -54,6 +47,9 @@ cd goodix-5201-linux/packaging/arch
 makepkg -si
 sudo pacman -S --needed fprintd
 ```
+
+It replaces the `libfprint` (or `libfprint-git`) package. An AUR package
+(`libfprint-goodix-5201`) will follow once AUR account registration reopens.
 
 **Omarchy:** then run the fingerprint setup from the Omarchy menu (*Setup →
 Security → Fingerprint*) or with `omarchy-setup-security-fingerprint`. It enrolls
