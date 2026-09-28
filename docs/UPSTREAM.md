@@ -4,6 +4,11 @@ The goal is for this driver to become part of
 [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint), so that
 distributions ship it and this repository is no longer needed.
 
+**Status:** not submitted yet. Submitting needs a gitlab.freedesktop.org account
+with fork permission. Everything needed, including feedback for the MR !530
+authors, is collected in
+[issue #1](https://github.com/J0UH/goodix-5201-linux/issues/1): help is welcome.
+
 ## Dependencies
 
 The driver needs SIGFM (see [MATCHING.md](MATCHING.md)), which is not in libfprint
